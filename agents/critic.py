@@ -21,7 +21,13 @@ def critic_agent(state: dict) -> dict:
     ])
     
     match = re.search(r'\{.*\}', response.content, re.DOTALL)
-    result = json.loads(match.group()) if match else {"passed": True, "issues": []}
+    if match:
+        try:
+            result = json.loads(match.group(), strict=False)
+        except json.JSONDecodeError:
+            result = {"passed": True, "issues": []}
+    else:
+        result = {"passed": True, "issues": []}
     
     if result.get("passed"):
         return {

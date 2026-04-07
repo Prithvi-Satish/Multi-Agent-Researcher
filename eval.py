@@ -30,8 +30,16 @@ Report:
 {report[:2000]}"""
     
     resp = llm.invoke([HumanMessage(content=prompt)])
-    m = re.search(r'\{.*\}', resp.content, re.DOTALL)
-    return json.loads(m.group()) if m else {}
+    return extract_json(resp.content)
+
+def extract_json(text):
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(), strict=False)
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
 if __name__ == "__main__":
     for query in TEST_QUERIES:

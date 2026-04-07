@@ -18,5 +18,11 @@ def planner_agent(state: dict) -> dict:
     ])
     # Parse JSON from response
     match = re.search(r'\[.*\]', response.content, re.DOTALL)
-    sub_questions = json.loads(match.group()) if match else [state['query']]
+    if match:
+        try:
+            sub_questions = json.loads(match.group(), strict=False)
+        except json.JSONDecodeError:
+            sub_questions = [state['query']]
+    else:
+        sub_questions = [state['query']]
     return {"sub_questions": sub_questions}
