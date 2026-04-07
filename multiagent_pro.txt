@@ -1,0 +1,498 @@
+MULTI-AGENT RESEARCH ASSISTANT
+
+Description: Orchestrate a team of specialized agents that search, read, synthesize, and report — autonomously.
+
+Agents:
+Planner agent:Breaks a research question into sub-tasks and assigns them to specialist agents with clear goals.
+Search agent:Queries Tavily or SerpAPI, reads full pages with web scraping, extracts key claims with citations.
+Critic agent:Reviews the draft report for logical gaps, unsupported claims, and conflicting sources.
+Writer agent:Synthesizes all gathered info into a structured markdown report with inline citations.
+
+Build steps
+01Start with LangGraph — define agents as graph nodes. Each node is an LLM call with a specific system prompt and tool access.
+02Build the Planner: prompt it to decompose a topic into 3–5 sub-questions, output JSON list of tasks.
+03Build the Search agent: give it Tavily search tool + BeautifulSoup for reading full pages. Store results in a shared context dict.
+04Run search agents in parallel using LangGraph's parallel branches — this is the key architecture skill to show.
+05Build the Writer agent: takes all context, generates a structured report with [Source N] citations throughout.
+06Add the Critic agent: prompts it to review the draft, output a list of issues, send back to Writer for one revision loop.
+07Add a trace viewer using LangSmith — show the full agent reasoning chain visually. Very impressive in demos.
+
+What makes it impressive
+Parallel execution:
+Shows you think about efficiency, not just correctness.
+Critic loop:
+Self-improving agents are a hot research pattern right now.
+LangSmith traces:
+Full observability — you can literally walk through the agent's thinking in an interview.
+
+Project setup & environment
+1 / 7
+Get your folder structure, install dependencies, and set up API keys before writing a single line of agent code.
+Folder structure
+research_assistant/ ├── agents/ │ ├── planner.py # breaks query into tasks │ ├── searcher.py # web search + scraping │ ├── writer.py # synthesizes report │ └── critic.py # reviews and scores draft ├── tools/ │ ├── search_tool.py # Tavily wrapper │ └── scrape_tool.py # BeautifulSoup page reader ├── graph.py # LangGraph workflow ├── state.py # shared state schema ├── app.py # Streamlit UI ├── .env # API keys └── requirements.txt
+Install dependencies:
+ terminal
+pip install langgraph langchain langchain-openai
+pip install tavily-python beautifulsoup4 requests
+pip install streamlit python-dotenv
+API keys needed
+OpenAI API key
+Get from platform.openai.com — GPT-4o-mini is cheap enough for testing ($0.15/1M tokens).
+Tavily API key
+Get from app.tavily.com — free tier gives 1000 searches/month. Best search API for LLM agents.
+.env
+OPENAI_API_KEY=sk-...
+TAVILY_API_KEY=tvly-...
+LANGCHAIN_API_KEY=ls-...      # optional, for traces
+LANGCHAIN_TRACING_V2=true
+Use GPT-4o-mini for the search and critic agents (cheap), GPT-4o only for the writer agent (quality matters for the final report). This keeps costs under $0.05 per research run.
+
+Define shared state
+2 / 7
+All agents share a single state object passed through the graph. Define it first — everything else depends on it.
+Why state matters in LangGraph
+In LangGraph, agents are nodes in a graph. They don't call each other directly — they read from and write to a shared state dict. This is what allows parallel execution and clean separation between agents.
+state.py
+from typing import TypedDict, List, Optional
+
+class ResearchState(TypedDict):
+    # Input
+    query: str
+
+    # Planner output
+    sub_questions: List[str]
+
+    # Searcher output (one entry per sub-question)
+    search_results: List[dict]   # [{question, content, sources}]
+
+    # Writer output
+    draft_report: Optional[str]
+
+    # Critic output
+    critique: Optional[str]
+    critique_passed: bool
+
+    # Final output
+    final_report: Optional[str]
+    sources: List[str]
+Keep state flat — no deeply nested dicts. Every key should be directly readable by any agent without unpacking layers of structure.
+What each agent reads and writes
+Planner reads
+query
+Planner writes
+sub_questions
+Searcher reads
+sub_questions
+Searcher writes
+search_results, sources
+Writer reads
+query, search_results
+Writer writes
+draft_report
+Critic reads
+draft_report, search_results
+Critic writes
+critique, critique_passed, final_report
+
+Build the search & scrape tools
+3 / 7
+The Searcher agent needs two tools: one to find URLs via Tavily, one to read the full content of each page.
+tools/search_tool.py
+from tavily import TavilyClient
+import os
+
+client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+def tavily_search(query: str, max_results: int = 5) -> list[dict]:
+    """Search the web and return results with URLs and snippets."""
+    response = client.search(
+        query=query,
+        max_results=max_results,
+        include_raw_content=False,
+        search_depth="advanced"
+    )
+    results = []
+    for r in response["results"]:
+        results.append({
+            "title": r["title"],
+            "url": r["url"],
+            "snippet": r["content"]
+        })
+    return results
+tools/scrape_tool.py
+import requests
+from bs4 import BeautifulSoup
+
+def scrape_page(url: str, max_chars: int = 3000) -> str:
+    """Fetch a URL and return clean readable text."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=8)
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Remove noise
+        for tag in soup(["script","style","nav","footer","header"]):
+            tag.decompose()
+
+        text = soup.get_text(separator=" ", strip=True)
+        # Return first max_chars to stay within token limits
+        return text[:max_chars]
+    except Exception as e:
+        return f"Could not scrape {url}: {str(e)}"
+Set max_chars=3000 per page. With 5 search results and 4 sub-questions, you'd pass 60K chars to the LLM without this — and blow your context window.
+Some sites block scrapers. Tavily's include_raw_content=True is a better option if you upgrade to a paid plan — it returns full text without needing BeautifulSoup.
+
+Build the four agents
+4 / 7
+Each agent is a Python function that takes state, calls an LLM, and returns updated state keys. Start with the Planner, then Searcher, Writer, Critic.
+Planner agent
+agents/planner.py
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+import json, re
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+PLANNER_PROMPT = """You are a research planner. Given a research topic,
+break it into exactly 4 focused sub-questions that together cover the topic
+comprehensively. Return ONLY a JSON array of strings, nothing else.
+
+Example output: ["What is X?", "How does X work?", "What are X limitations?", "What is the future of X?"]"""
+
+def planner_agent(state: dict) -> dict:
+    response = llm.invoke([
+        SystemMessage(content=PLANNER_PROMPT),
+        HumanMessage(content=f"Research topic: {state['query']}")
+    ])
+    # Parse JSON from response
+    match = re.search(r'[.*]', response.content, re.DOTALL)
+    sub_questions = json.loads(match.group()) if match else [state['query']]
+    return {"sub_questions": sub_questions}
+Searcher agent
+agents/searcher.py
+from tools.search_tool import tavily_search
+from tools.scrape_tool import scrape_page
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+def searcher_agent(state: dict) -> dict:
+    all_results = []
+    all_sources = []
+
+    for question in state["sub_questions"]:
+        # Search for top 3 results per sub-question
+        results = tavily_search(question, max_results=3)
+        
+        # Scrape full content from each result
+        context_chunks = []
+        for r in results:
+            content = scrape_page(r["url"])
+            context_chunks.append(f"Source: {r['url']}
+{content}")
+            all_sources.append(r["url"])
+        
+        # Summarize findings for this sub-question
+        combined = "
+
+---
+
+".join(context_chunks)
+        summary = llm.invoke([
+            SystemMessage(content="Summarize the key facts from these sources that answer the question. Be concise and cite sources by URL."),
+            HumanMessage(content=f"Question: {question}
+
+Sources:
+{combined}")
+        ])
+        
+        all_results.append({
+            "question": question,
+            "answer": summary.content,
+            "sources": [r["url"] for r in results]
+        })
+
+    return {"search_results": all_results, "sources": list(set(all_sources))}
+Writer agent
+agents/writer.py
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0.3)  # Use GPT-4o for quality
+
+WRITER_PROMPT = """You are a research report writer. Write a comprehensive,
+well-structured markdown report. Requirements:
+- Start with an executive summary (2-3 sentences)
+- Use ## headings for each major section
+- Cite sources inline as [Source: URL]
+- End with a ## Key Takeaways section (bullet points)
+- Be factual, clear, and avoid padding"""
+
+def writer_agent(state: dict) -> dict:
+    context = "
+
+".join([
+        f"### {r['question']}
+{r['answer']}"
+        for r in state["search_results"]
+    ])
+    
+    response = llm.invoke([
+        SystemMessage(content=WRITER_PROMPT),
+        HumanMessage(content=f"Topic: {state['query']}
+
+Research findings:
+{context}")
+    ])
+    return {"draft_report": response.content}
+Critic agent
+agents/critic.py
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+import json, re
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+CRITIC_PROMPT = """Review this research report and return JSON with:
+{
+  "passed": true/false,
+  "issues": ["issue 1", "issue 2"],  // empty list if passed
+  "improved_report": "full improved report text"  // only if not passed
+}
+Fail the report if: claims are unsupported, key aspects are missing,
+or the structure is unclear. Pass if the report is factual and complete."""
+
+def critic_agent(state: dict) -> dict:
+    response = llm.invoke([
+        SystemMessage(content=CRITIC_PROMPT),
+        HumanMessage(content=f"Report to review:
+{state['draft_report']}")
+    ])
+    
+    match = re.search(r'{.*}', response.content, re.DOTALL)
+    result = json.loads(match.group()) if match else {"passed": True, "issues": []}
+    
+    if result.get("passed"):
+        return {
+            "critique_passed": True,
+            "critique": "Report passed review.",
+            "final_report": state["draft_report"]
+        }
+    else:
+        issues = "
+".join(result.get("issues", []))
+        improved = result.get("improved_report", state["draft_report"])
+        return {
+            "critique_passed": True,  # one revision max
+            "critique": f"Issues found:
+{issues}",
+            "final_report": improved
+        }
+
+Wire the LangGraph workflow
+5 / 7
+Connect all agents into a directed graph with conditional edges. This is where the architecture comes alive.
+graph.py
+from langgraph.graph import StateGraph, END
+from state import ResearchState
+from agents.planner import planner_agent
+from agents.searcher import searcher_agent
+from agents.writer import writer_agent
+from agents.critic import critic_agent
+
+def build_graph():
+    # Create the graph with our state schema
+    graph = StateGraph(ResearchState)
+
+    # Add all agent nodes
+    graph.add_node("planner",  planner_agent)
+    graph.add_node("searcher", searcher_agent)
+    graph.add_node("writer",   writer_agent)
+    graph.add_node("critic",   critic_agent)
+
+    # Define the flow
+    graph.set_entry_point("planner")
+    graph.add_edge("planner",  "searcher")
+    graph.add_edge("searcher", "writer")
+    graph.add_edge("writer",   "critic")
+
+    # Conditional edge: critic can send back to writer or end
+    def should_revise(state):
+        # We do max 1 revision — critic always ends after one pass
+        return END
+
+    graph.add_conditional_edges("critic", should_revise)
+
+    return graph.compile()
+
+# Build once, reuse
+research_graph = build_graph()
+Run it from the terminal
+terminal — quick test
+python -c "
+from graph import research_graph
+result = research_graph.invoke({
+    'query': 'What is the current state of quantum computing?',
+    'sub_questions': [],
+    'search_results': [],
+    'draft_report': None,
+    'critique': None,
+    'critique_passed': False,
+    'final_report': None,
+    'sources': []
+})
+print(result['final_report'])
+"
+LangGraph streams state after each node. You can do for step in research_graph.stream(initial_state): print(step) to watch the agent reasoning live — great for debugging and demos.
+Adding parallel search (advanced)
+graph.py — parallel variant
+from langgraph.graph import StateGraph, END, Send
+
+# Instead of one searcher node that loops internally,
+# fan out to N parallel searcher nodes using Send
+def fan_out_to_searchers(state):
+    return [
+        Send("searcher", {"query": state["query"], "question": q})
+        for q in state["sub_questions"]
+    ]
+
+graph.add_conditional_edges("planner", fan_out_to_searchers, ["searcher"])
+# Each parallel branch writes to search_results independently
+# LangGraph merges them automatically
+
+Build the Streamlit frontend
+6 / 7
+A clean UI that shows the research progress live — each agent step streams in as it completes.
+app.py
+import streamlit as st
+from graph import research_graph
+from state import ResearchState
+
+st.set_page_config(page_title="Research Assistant", layout="wide")
+st.title("Multi-agent research assistant")
+st.caption("Powered by LangGraph + GPT-4o + Tavily")
+
+query = st.text_input(
+    "Enter your research topic",
+    placeholder="e.g. What is the future of nuclear energy?"
+)
+
+if st.button("Research", type="primary") and query:
+    initial_state: ResearchState = {
+        "query": query, "sub_questions": [], "search_results": [],
+        "draft_report": None, "critique": None,
+        "critique_passed": False, "final_report": None, "sources": []
+    }
+
+    # Live progress display
+    with st.status("Running research agents...", expanded=True) as status:
+        
+        for step_name, step_state in research_graph.stream(initial_state):
+            
+            if "planner" in step_name:
+                st.write("Planner: breaking query into sub-questions")
+                for q in step_state.get("sub_questions", []):
+                    st.caption(f"  — {q}")
+            
+            elif "searcher" in step_name:
+                st.write("Searcher: gathering sources from the web")
+                n = len(step_state.get("search_results", []))
+                st.caption(f"  — Found results for {n} sub-questions")
+            
+            elif "writer" in step_name:
+                st.write("Writer: drafting the report")
+            
+            elif "critic" in step_name:
+                st.write("Critic: reviewing report quality")
+                st.caption(f"  — {step_state.get('critique','')}")
+        
+        status.update(label="Research complete!", state="complete")
+
+    # Final outputs
+    final = research_graph.invoke(initial_state)
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.markdown("## Report")
+        st.markdown(final["final_report"])
+    
+    with col2:
+        st.markdown("## Sources")
+        for url in final["sources"][:10]:
+            st.markdown(f"- [{url[:50]}...]({url})")
+Run the app
+terminal
+streamlit run app.py
+The st.status() container with expanded=True shows live agent progress. Users can see the planner's sub-questions appear before the search even starts — makes the app feel alive and transparent.
+
+Eval, tracing & deployment
+7 / 7
+Add LangSmith tracing, measure output quality, and deploy to the internet. This is what separates a finished project from a draft.
+LangSmith tracing (5 minutes to set up)
+.env — add these lines
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=ls-...
+LANGCHAIN_PROJECT=research-assistant
+That's it — every graph run now appears in LangSmith's UI at smith.langchain.com. You get full token counts, latency per agent, and the complete message history. Take a screenshot for your portfolio.
+Add a simple eval script
+eval.py
+from graph import research_graph
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+TEST_QUERIES = [
+    "What is quantum computing?",
+    "How does CRISPR gene editing work?",
+    "What are the risks of AI in healthcare?"
+]
+
+def score_report(query: str, report: str) -> dict:
+    prompt = f"""Score this research report on the topic '{query}' from 1-5 on:
+- Completeness: Does it cover all key aspects?
+- Accuracy: Are claims well-supported?
+- Clarity: Is it well-structured and readable?
+
+Return JSON: {{"completeness": N, "accuracy": N, "clarity": N, "overall": N}}
+
+Report:
+{report[:2000]}"""
+    
+    resp = llm.invoke([HumanMessage(content=prompt)])
+    import json, re
+    m = re.search(r'{.*}', resp.content, re.DOTALL)
+    return json.loads(m.group()) if m else {}
+
+for query in TEST_QUERIES:
+    state = {"query": query, "sub_questions": [], "search_results": [],
+             "draft_report": None, "critique": None,
+             "critique_passed": False, "final_report": None, "sources": []}
+    result = research_graph.invoke(state)
+    scores = score_report(query, result["final_report"])
+    print(f"{query[:40]}: {scores}")
+Deploy to Streamlit Cloud (free)
+1Push your project to a public GitHub repo. Add arequirements.txtwith all packages.
+2Go to share.streamlit.io → New app → connect your repo → setapp.pyas main file.
+3Add your API keys in the Streamlit Secrets panel (replaces .env in production).
+4Click Deploy. You get a public URL likeyourname-research-assistant.streamlit.app.
+What to put in your README
+Architecture diagram
+A simple flowchart showing Planner → Searcher → Writer → Critic. Recruiters read READMEs before code.
+Eval results
+Show your eval scores from eval.py. A table of completeness/accuracy/clarity across 3 test queries.
+LangSmith screenshot
+Show the trace view — token counts, latency per agent, full reasoning chain. Very impressive to interviewers.
+Cost per run
+Calculate average token usage and cost. Shows you think about production constraints, not just functionality.
+LangGraphLangSmith tracesTavily searchStreamlit CloudLLM-as-judge evalsGitHub Actions CI
+
+Here's the full sequence at a glance so you know what you're building toward:
+Phase 1 sets up your folder, installs packages, and wires up API keys
+Phase 2 defines the ResearchState schema — the backbone everything else reads from
+Phase 3 builds the two low-level tools (Tavily search + BeautifulSoup scraper) that the Searcher agent calls
+Phase 4 builds all four agents as standalone Python functions — Planner, Searcher, Writer, and Critic
+Phase 5 connects them into a LangGraph StateGraph with directed edges and an optional parallel fan-out pattern
+Phase 6 wraps everything in a Streamlit UI that streams agent progress live as it runs
+Phase 7 adds LangSmith tracing, an LLM-as-judge eval script, and deploys to Streamlit Cloud with a public URL
